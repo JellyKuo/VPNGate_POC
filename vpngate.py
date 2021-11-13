@@ -5,8 +5,13 @@ import tempfile
 import platform
 import base64
 import time
+import signal
+import sys
 
+# Globally static OpenVPN process (Should use a better method to do this like class encapsulation)
+# It's a POC please don't kill me
 __openvpn_proc__ = None
+
 
 class VPNGateServer:
     def __init__(self, server_str):
@@ -55,61 +60,91 @@ def get_vpn_list():
     response = response.split('\n')[2:-2]
     return [VPNGateServer(server_str) for server_str in response]
 
-# Globally static OpenVPN process (Should use a better method to do this)
-
 
 def connect_vpn(server: VPNGateServer):
+    global __openvpn_proc__
+
     if platform.system() == "Windows":
         openvpn_path = "C:\\Program Files\\OpenVPN\\bin\\openvpn.exe"
     else:
         openvpn_path = "/usr/bin/openvpn"
 
-    # 0. Check if OpenVPN executable exists
+    # 0.0. Check if OpenVPN executable exists
     if not os.path.exists(openvpn_path):
         raise FileNotFoundError(f"OpenVPN not found in {openvpn_path}")
 
     # 0.1. Check if OpenVPN is running
-    global __openvpn_proc__
     if __openvpn_proc__ is not None:
-        raise Exception("OpenVPN is already running")
-    
+        raise Exception(
+            "An existing OpenVPN connection is connected, call disconnect first")
+
     # 1. Log the current IP for connection verification
     current_ip = get_ip()
+    if current_ip is None:
+        raise Exception("Could not get current IP.")
 
-    # 1. Write the config file
+    # 2.1. Write the config file
     ovpn_config_bytes = base64.b64decode(server.ovpn_config_b64)
     auth_file = tempfile.NamedTemporaryFile(suffix='.txt', delete=False)
-    # Generate authentication file
+    # 2.2 Generate authentication file
     auth_file.writelines([b"vpn\n", b"vpn"])
     auth_file.close()
-    ovpn_file = tempfile.NamedTemporaryFile(prefix="vpngate_", suffix=".ovpn", delete=False)
+    ovpn_file = tempfile.NamedTemporaryFile(
+        prefix="vpngate_", suffix=".ovpn", delete=False)
     ovpn_file.write(ovpn_config_bytes)
     ovpn_file.close()
-    
-    # 2. Start OpenVPN
+
+    # 3. Start OpenVPN
     retries = 0
     max_retries = 5
     while retries < max_retries:
-        proc = subprocess.Popen([openvpn_path, '--config', ovpn_file.name, '--auth-user-pass', auth_file.name])
-        # 3. Wait for the connection to be established
-        #   OpenVPN process quits (Poll is not None)
-        #   VPN connection is established (Current IP is different from the one before)
-        #   Timeout reached (wait_counter reached max_wait)
-        max_wait = 10
-        wait_counter = 0
-        while proc.poll() is None and get_ip() == current_ip and wait_counter < max_wait:
+        proc = subprocess.Popen(
+            [openvpn_path, '--config', ovpn_file.name, '--auth-user-pass', auth_file.name], stdin=subprocess.PIPE, shell=False)
+        start_time = time.time()
+        max_wait_time = 30  # Waits for 30 seconds and assume timeout
+        while proc.poll() is None:
+            # Process not terminated, check for network connectivity
+            ip = get_ip()
+            if ip is not None and ip != current_ip:
+                # IP has changed, VPN connection is established
+                print("VPN connection established!")
+                __openvpn_proc__ = proc
+                return
+            # IP has not changed or is unavailable, VPN connection is not established
+            # Check for timeout and wait a second for next check
+            if time.time() - start_time >= max_wait_time:
+                # Wait time expired, kill the process
+                print("VPN connection timed out, killing process...")
+                proc.kill()
+                break
             time.sleep(1)
-            wait_counter += 1
-        # 4. Handling errors
-        if proc.poll() is not None or get_ip() != current_ip or wait_counter >= max_wait:
-            retries+=1
-            print(f"VPN connection error, waiting 3 seconds to retry... {retries}/{max_retries}")
-            time.sleep(3)
-            continue # Retry
-        print("VPN connection established!")
-        # 5. Setup global OpenVPN process
-        __openvpn_proc__ = proc
-        break # Do not retry
+
+        # Process terminated, something went wrong
+        retries += 1
+        print(f"VPN connection failed, retrying... {retries}/{max_retries}")
+
+
+def disconnect_vpn():
+    global __openvpn_proc__
+    if __openvpn_proc__ is not None:
+        __openvpn_proc__.terminate()
+        __openvpn_proc__ = None
+    else:
+        raise Exception("No VPN connection is connected")
+
+
+def is_vpn_connected():
+    global __openvpn_proc__
+    return __openvpn_proc__ is not None
+
 
 def get_ip():
-    return requests.get('http://ifconfig.me').text
+    try:
+        return requests.get('http://ifconfig.me', timeout=3).text
+    except:
+        return None
+
+
+def __sigint_ignore_preexec_fn__():
+    # Ignore SIGINT signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
